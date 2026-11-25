@@ -8,7 +8,9 @@
   // ===== CONFIGURAÇÕES E STORAGE =====
   const TODAY_KEY = 'gc_pro_interactions_v3_' + new Date().toISOString().slice(0, 10);
   const CFG_KEY = 'gc_pro_config_v3';
+  const METRICS_KEY = 'gc_pro_metrics_v3';
   const THRESHOLD_SEC = 70; // 1m 10s
+  const DASH_PIP_URL = 'https://script.google.com/a/macros/grupobrisanet.com.br/s/AKfycbysdYRZyX0strR8XbMVoc2UEKB6mHGzD8iugx1-O8_NFRkZJeiiulLpIlv4gA1fANp2/exec';
 
   const THEMES = {
     deepspace: {
@@ -43,6 +45,23 @@
     }
   };
 
+  // Regras de meta e tradução para os indicadores da API do Genesys
+  const METRIC_META = {
+    'Number of Interaction Answered': { label: 'Qtd. Interações Atendidas', type: 'high', min: 32, mid: 36, max: 40, scaleMax: 44 },
+    'Number of Interaction': { label: 'Total de Interações', type: 'high', min: 32, mid: 36, max: 40, scaleMax: 44 },
+    'Average After Call Work': { label: 'TPC Médio', type: 'mid', min: 5, midLow: 10, midHigh: 15, max: 30, scaleMax: 35 },
+    'Average Handle Time': { label: 'TMA Geral', type: 'mid', min: 60, midLow: 300, midHigh: 460, max: 600, scaleMax: 900 },
+    'Interaction Answered Ratio': { label: 'Taxa de Atendimento', type: 'high', min: 83, mid: 88, max: 92, scaleMax: 100 },
+    'Calls Transferred Ratio': { label: 'Taxa de Transferência', type: 'low', min: 10, mid: 20, max: 35, scaleMax: 100 },
+    'After Call Work Time Ratio': { label: 'Taxa de TPC', type: 'low', min: 2, mid: 5, max: 10, scaleMax: 25 },
+    'Hold Time Ratio': { label: 'Taxa de Espera', type: 'low', min: 5, mid: 15, max: 30, scaleMax: 60 },
+    'Average Hold Time': { label: 'Tempo Médio em Espera', type: 'low', min: 60, mid: 180, max: 360, scaleMax: 720 },
+    'AVERAGE_TALK_TIME': { label: 'Tempo Médio de Conversa', type: 'mid', min: 60, midLow: 180, midHigh: 360, max: 480, scaleMax: 660 },
+    'AVERAGE_ALERT_TIME': { label: 'Tempo Médio de Alerta', type: 'low', min: 3, mid: 6, max: 10, scaleMax: 20 },
+    'Number of Transfer': { label: 'Qtd. de Transferências', type: 'low', min: 2, mid: 5, max: 10, scaleMax: 20 },
+    'Total Talk Time': { label: 'Tempo Total de Conversa', type: 'high', min: 3600, mid: 10800, max: 18000, scaleMax: 21600 }
+  };
+
   let config = Object.assign({
     theme: 'deepspace',
     apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
@@ -51,10 +70,13 @@
   }, JSON.parse(localStorage.getItem(CFG_KEY) || '{}'));
 
   let interactions = JSON.parse(localStorage.getItem(TODAY_KEY) || '{}');
+  let cachedMetrics = JSON.parse(localStorage.getItem(METRICS_KEY) || '{"updatedAt":null,"points":null,"items":[]}');
   let menuOpen = false;
+  let pipLoaded = false;
 
   const saveConfig = () => localStorage.setItem(CFG_KEY, JSON.stringify(config));
   const saveInteractions = () => localStorage.setItem(TODAY_KEY, JSON.stringify(interactions));
+  const saveMetrics = () => localStorage.setItem(METRICS_KEY, JSON.stringify(cachedMetrics));
 
   // ===== PRIVACIDADE E UTILITÁRIOS =====
   const hashStr = (str) => {
@@ -66,7 +88,6 @@
     return 'ATD-' + (h >>> 0).toString(36).toUpperCase().slice(0, 6);
   };
 
-  // Remove dados sensíveis (CPF, CNPJ, tel, e-mail, CEP) mantendo o nome da interação
   const scrubPII = (text) => (text || '')
     .replace(/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g, '[CPF_OCULTO]')
     .replace(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g, '[CNPJ_OCULTO]')
@@ -77,6 +98,154 @@
     .trim();
 
   const fmtTime = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+
+  const fmtMetricVal = (val, unitType) => {
+    if (val === null || val === undefined || Number.isNaN(val)) return '-';
+    if (unitType === 'Seconds') {
+      const total = Math.round(val);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+      return `${s}s`;
+    }
+    if (unitType === 'Percent') {
+      return `${val.toFixed(1).replace('.', ',')}%`;
+    }
+    return String(Math.round(val));
+  };
+
+  // ===== API DE MÉTRICAS DO GENESYS =====
+  const getGenesysToken = () => {
+    for (const raw of [
+      sessionStorage.getItem('gcui_auth'),
+      sessionStorage.getItem('gcui_session'),
+      localStorage.getItem('pc_auth')
+    ]) {
+      if (!raw) continue;
+      try {
+        const o = JSON.parse(raw);
+        const t = o.token || o.access_token || o.accessToken || o?.auth?.token || o?.session?.token;
+        if (t && t.length > 20) return t;
+      } catch {}
+      const clean = raw.replace(/^["']|["']$/g, '').trim();
+      if (clean.length > 20 && !clean.includes(' ')) return clean;
+    }
+    return null;
+  };
+
+  const evaluateLifeBar = (val, unitType, rule) => {
+    if (!rule) {
+      const pct = unitType === 'Percent' ? Math.max(2, Math.min(98, val)) : 50;
+      return {
+        pct,
+        inTarget: false,
+        segments: ['seg-0', 'seg-1', 'seg-2', 'seg-3'],
+        minLbl: '0',
+        midLbl: unitType === 'Percent' ? '50%' : '-',
+        maxLbl: unitType === 'Percent' ? '100%' : '-'
+      };
+    }
+
+    const scaleMax = rule.scaleMax || rule.max * 1.2;
+    const pct = Math.max(2, Math.min(98, (val / scaleMax) * 100));
+
+    if (rule.type === 'high') {
+      return {
+        pct,
+        inTarget: val >= rule.max,
+        segments: ['seg-0', 'seg-1', 'seg-2', 'seg-3'],
+        minLbl: fmtMetricVal(rule.min, unitType),
+        midLbl: fmtMetricVal(rule.mid, unitType),
+        maxLbl: fmtMetricVal(rule.max, unitType)
+      };
+    }
+
+    if (rule.type === 'low') {
+      return {
+        pct,
+        inTarget: val <= rule.min,
+        segments: ['seg-3', 'seg-2', 'seg-1', 'seg-0'],
+        minLbl: fmtMetricVal(rule.min, unitType),
+        midLbl: fmtMetricVal(rule.mid, unitType),
+        maxLbl: fmtMetricVal(rule.max, unitType)
+      };
+    }
+
+    return {
+      pct,
+      inTarget: val >= rule.midLow && val <= rule.midHigh,
+      segments: ['seg-0', 'seg-2', 'seg-3', 'seg-2', 'seg-0'],
+      minLbl: fmtMetricVal(rule.min, unitType),
+      midLbl: `${fmtMetricVal(rule.midLow, unitType)}–${fmtMetricVal(rule.midHigh, unitType)}`,
+      maxLbl: fmtMetricVal(rule.max, unitType)
+    };
+  };
+
+  const syncMetricsAPI = async () => {
+    const token = getGenesysToken();
+    const statusEl = shadow.getElementById('met-status');
+    if (!token) {
+      if (statusEl) statusEl.textContent = 'Sessão do Genesys não detectada.';
+      return;
+    }
+
+    const hostApi = location.hostname.replace(/^apps?\./, 'api.');
+    const today = new Date().toISOString().slice(0, 10);
+    const headers = { Authorization: 'Bearer ' + token };
+
+    if (statusEl) statusEl.textContent = 'Atualizando indicadores...';
+
+    try {
+      const [valRes, ptsRes] = await Promise.all([
+        fetch(`https://${hostApi}/api/v2/gamification/scorecards/values/trends?startWorkday=${today}&endWorkday=${today}`, { headers }),
+        fetch(`https://${hostApi}/api/v2/gamification/scorecards/points/trends?startWorkday=${today}&endWorkday=${today}`, { headers })
+      ]);
+
+      let points = cachedMetrics.points;
+      if (ptsRes.ok) {
+        const ptsData = await ptsRes.json();
+        points = ptsData?.averagePoints ?? ptsData?.trend?.[0]?.points ?? points;
+      }
+
+      if (valRes.ok) {
+        const valData = await valRes.json();
+        const rawList = valData?.results || [];
+
+        const items = rawList.map((r) => {
+          const rawName = r.metricDefinition?.name || 'Indicador';
+          const rule = METRIC_META[rawName];
+          const val = r.average ?? r.trend?.[0]?.value ?? 0;
+          const unitType = r.unitType || 'Number';
+          const bar = evaluateLifeBar(val, unitType, rule);
+
+          return {
+            rawName,
+            title: rule ? rule.label : rawName,
+            valueFormatted: fmtMetricVal(val, unitType),
+            pct: bar.pct,
+            inTarget: bar.inTarget,
+            segments: bar.segments,
+            minLbl: bar.minLbl,
+            midLbl: bar.midLbl,
+            maxLbl: bar.maxLbl,
+            priority: rule ? Object.keys(METRIC_META).indexOf(rawName) : 99
+          };
+        }).sort((a, b) => a.priority - b.priority);
+
+        cachedMetrics = {
+          updatedAt: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+          points,
+          items
+        };
+        saveMetrics();
+        renderMetrics();
+      }
+    } catch (e) {
+      if (statusEl) statusEl.textContent = 'Erro ao atualizar. Clique em ↻.';
+    }
+  };
 
   // ===== DETECÇÃO GENESYS (CARD LATERAL + CABEÇALHO) =====
   const findSelectedRosterCard = (rawName) => {
@@ -121,7 +290,7 @@
     };
   };
 
-  // ===== INJEÇÃO 1: CRONÔMETRO PEQUENO EM CIMA DO NOME NO CARD (FOTO 1) =====
+  // ===== INJEÇÃO 1: CRONÔMETRO PEQUENO NO CARD LATERAL =====
   const updateCardTimerBadge = (card, rec) => {
     if (!card) return;
     if (getComputedStyle(card).position === 'static') {
@@ -145,7 +314,7 @@
     }
   };
 
-  // ===== INJEÇÃO 2: BOTÃO COPIAR NOME + URL AO LADO DOS BOTÕES DA FOTO 2 =====
+  // ===== INJEÇÃO 2: BOTÃO COPIAR NOME + URL =====
   const ensureCopyBothButton = () => {
     const actionsBox = document.querySelector('.selected-interaction-container .interaction-header-v2 .actions-container');
     if (!actionsBox || document.getElementById('gc-pro-copy-both-btn')) return;
@@ -169,7 +338,6 @@
       const name = scrubPII(nameEl ? nameEl.textContent.trim() : '') || 'Interação';
 
       let url = window.location.href;
-      // Se existir o botão nativo de copiar URL da interação, tenta capturar a URL exata dele
       const nativeCopy = document.querySelector('.selected-interaction-container .copy-action-button');
       if (nativeCopy) {
         nativeCopy.click();
@@ -180,9 +348,7 @@
         } catch (_) {}
       }
 
-      const payload = `${name}\n${url}`;
-      await navigator.clipboard.writeText(payload);
-
+      await navigator.clipboard.writeText(`${name}\n${url}`);
       btn.innerHTML = '✓';
       btn.style.background = '#16a34a';
       btn.style.color = '#fff';
@@ -212,6 +378,10 @@
         0% { background-position: 0% 50%; }
         50% { background-position: 100% 50%; }
         100% { background-position: 0% 50%; }
+      }
+      @keyframes pulsePin {
+        0%, 100% { box-shadow: 0 0 0 2px rgba(255,255,255,.85), 0 0 8px var(--accent); }
+        50% { box-shadow: 0 0 0 3px #fff, 0 0 14px var(--accent); }
       }
       .anim-grad {
         background: var(--grad);
@@ -258,29 +428,32 @@
 
       /* PAINÉIS ARRASTÁVEIS E REDIMENSIONÁVEIS */
       .panel {
-        position: fixed; width: 350px; height: 420px; min-width: 240px; min-height: 220px;
-        max-width: 90vw; max-height: 90vh; pointer-events: auto;
+        position: fixed; width: 350px; height: 430px; min-width: 240px; min-height: 220px;
+        max-width: 92vw; max-height: 90vh; pointer-events: auto;
         background: var(--bg); color: var(--text); border: 1px solid var(--border);
         border-radius: 14px; box-shadow: 0 16px 40px rgba(0,0,0,.5);
         display: none; flex-direction: column; overflow: hidden;
       }
       .panel.open { display: flex; }
-      #panel-int { resize: both; }
+      #panel-int, #panel-pip, #panel-met { resize: both; }
       #panel-ai { height: auto; max-height: 540px; }
       #panel-vis { height: auto; }
+      #panel-pip { width: 460px; height: 420px; }
+      #panel-met { width: 390px; height: 500px; }
 
       .p-head {
         display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
-        padding: 11px 14px; cursor: grab; user-select: none; color: #fff;
+        padding: 10px 14px; cursor: grab; user-select: none; color: #fff;
         border-bottom: 1px solid rgba(255,255,255,.12);
       }
       .p-head:active { cursor: grabbing; }
       .p-title { font-size: 12.5px; font-weight: 700; letter-spacing: .3px; }
-      .p-close {
+      .p-head-actions { display: flex; gap: 6px; align-items: center; }
+      .p-close, .p-icon-btn {
         background: rgba(0,0,0,.25); border: none; color: #fff; width: 22px; height: 22px;
         border-radius: 50%; cursor: pointer; font-size: 12px; display: grid; place-items: center;
       }
-      .p-close:hover { background: rgba(0,0,0,.45); }
+      .p-close:hover, .p-icon-btn:hover { background: rgba(0,0,0,.45); }
       .p-body {
         padding: 12px 14px; flex: 1; min-height: 0; overflow-y: auto;
         display: flex; flex-direction: column; gap: 10px;
@@ -297,7 +470,7 @@
       #live-timer { font-size: 12px; font-variant-numeric: tabular-nums; }
       #live-timer.done { color: var(--success); font-size: 15px; }
 
-      /* QUADRADOS DO CONTADOR (MESMO TAMANHO) */
+      /* QUADRADOS DO CONTADOR */
       .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; flex-shrink: 0; }
       .stat-sq {
         aspect-ratio: 1 / 1; border-radius: 12px; background: var(--surface);
@@ -309,7 +482,7 @@
       .stat-sq.primary .num { color: var(--accent); }
       .stat-sq .lbl { font-size: 10px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
 
-      .list { display: flex; flex-direction: column; gap: 6px; flex: 1; min-height: 60px; overflow-y: auto; }
+      .list { display: flex; flex-direction: column; gap: 6px; flex: 1; min-height: 56px; overflow-y: auto; }
       .item {
         background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
         padding: 7px 10px; display: flex; justify-content: space-between; align-items: center; font-size: 11.5px; gap: 8px;
@@ -322,6 +495,57 @@
         color: var(--success); font-size: 12px; font-weight: 800; flex-shrink: 0;
       }
 
+      /* MÉTRICAS COM BARRINHA DE VIDA ADAPTADA AO VISUAL */
+      .met-summary-bar {
+        display: flex; justify-content: space-between; align-items: center;
+        background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+        padding: 8px 11px; flex-shrink: 0;
+      }
+      .met-pts-pill {
+        font-size: 12px; font-weight: 800; color: var(--accent);
+        background: var(--bg); border: 1px solid var(--border); padding: 3px 9px; border-radius: 99px;
+      }
+      .metrics-list { display: flex; flex-direction: column; gap: 9px; }
+      .life-card {
+        background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+        padding: 10px 11px; display: flex; flex-direction: column; gap: 7px;
+      }
+      .life-card.in-target { border-color: var(--accent); box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); }
+      .life-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+      .life-title { font-size: 12px; font-weight: 700; color: var(--text); }
+      .life-val {
+        font-size: 12px; font-weight: 800; color: var(--text);
+        background: var(--bg); border: 1px solid var(--border); padding: 2px 7px; border-radius: 6px;
+        flex-shrink: 0;
+      }
+      .life-val.ok { color: var(--accent); border-color: var(--accent); }
+
+      .life-bar-wrap { position: relative; padding: 5px 0; }
+      .life-bar {
+        display: flex; width: 100%; height: 11px; border-radius: 99px; overflow: hidden;
+        background: var(--bg); border: 1px solid var(--border); gap: 2px; padding: 1px;
+      }
+      .life-seg { flex: 1; height: 100%; border-radius: 99px; }
+      .seg-0 { background: var(--accent); opacity: 0.16; }
+      .seg-1 { background: var(--accent); opacity: 0.38; }
+      .seg-2 { background: var(--accent); opacity: 0.68; }
+      .seg-3 { background: var(--grad); background-size: 260% 260%; animation: gradMove 9s ease infinite; opacity: 1; }
+
+      .life-pin {
+        position: absolute; top: 50%; transform: translate(-50%, -50%);
+        width: 14px; height: 14px; border-radius: 50%; background: #fff;
+        border: 2.5px solid var(--accent); z-index: 3; animation: pulsePin 2.2s infinite;
+      }
+
+      .life-scales {
+        display: flex; justify-content: space-between; align-items: center;
+        font-size: 10px; color: var(--muted); gap: 6px;
+      }
+      .life-scales span strong { color: var(--text); font-weight: 600; }
+
+      /* MINI TELA DASH PIP */
+      .pip-frame { width: 100%; height: 100%; border: 0; background: #fff; flex: 1; }
+
       .btn {
         color: #fff; border: none; border-radius: 8px; padding: 8px 12px;
         font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity .15s;
@@ -330,7 +554,8 @@
       .btn.sec { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
       .btn.sec:hover { border-color: var(--accent); }
       .btn.rec { background: var(--danger); }
-      .row { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+      .btn.sm { padding: 5px 9px; font-size: 11px; }
+      .row { display: flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
 
       textarea, input {
         width: 100%; background: var(--surface); color: var(--text); border: 1px solid var(--border);
@@ -351,10 +576,10 @@
       details summary { font-size: 11px; color: var(--muted); cursor: pointer; margin-bottom: 6px; }
     </style>
 
-    <!-- PAINEL 1: INTERAÇÕES (FIXO E REDIMENSIONÁVEL) -->
+    <!-- PAINEL 1: INTERAÇÕES -->
     <div id="panel-int" class="panel open" style="bottom: 88px; right: 22px;">
       <div class="p-head anim-grad" data-drag="panel-int">
-        <span class="p-title">📊 Interações do Dia (≥ 1m 10s)</span>
+        <span class="p-title">Interações</span>
         <button class="p-close" data-toggle="panel-int">✕</button>
       </div>
       <div class="p-body">
@@ -382,14 +607,48 @@
 
         <div id="int-list" class="list"></div>
 
-        <div class="row" style="justify-content: space-between;">
-          <span class="note">Sem duplicidade • Arraste o canto p/ redimensionar</span>
-          <button id="btn-clear-int" class="btn sec" style="padding:4px 8px;font-size:11px;">Zerar Dia</button>
+        <div class="row" style="justify-content: space-between; border-top: 1px solid var(--border); padding-top: 8px;">
+          <div class="row">
+            <button id="btn-open-pip" class="btn anim-grad sm">Dash PIP</button>
+            <button class="btn sec sm" data-toggle="panel-met">Métricas</button>
+          </div>
+          <button id="btn-clear-int" class="btn sec sm">Zerar Dia</button>
         </div>
       </div>
     </div>
 
-    <!-- PAINEL 2: IA RESUMO -->
+    <!-- MINI TELA FLUTUANTE: DASH PIP -->
+    <div id="panel-pip" class="panel" style="bottom: 88px; right: 386px;">
+      <div class="p-head anim-grad" data-drag="panel-pip">
+        <span class="p-title">Dash PIP • Verificação de Meta</span>
+        <div class="p-head-actions">
+          <button id="btn-pip-reload" class="p-icon-btn" title="Recarregar">↻</button>
+          <button id="btn-pip-ext" class="p-icon-btn" title="Abrir em nova aba">↗</button>
+          <button class="p-close" data-toggle="panel-pip">✕</button>
+        </div>
+      </div>
+      <iframe id="pip-iframe" class="pip-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>
+    </div>
+
+    <!-- PAINEL: MÉTRICAS (API DIRETA + BARRA DE VIDA) -->
+    <div id="panel-met" class="panel" style="bottom: 88px; right: 386px;">
+      <div class="p-head anim-grad" data-drag="panel-met">
+        <span class="p-title">Métricas</span>
+        <div class="p-head-actions">
+          <button id="btn-met-sync" class="p-icon-btn" title="Atualizar agora">↻</button>
+          <button class="p-close" data-toggle="panel-met">✕</button>
+        </div>
+      </div>
+      <div class="p-body">
+        <div class="met-summary-bar">
+          <span id="met-status" class="note">Carregando indicadores...</span>
+          <span id="met-pts" class="met-pts-pill">💎 -- pts</span>
+        </div>
+        <div id="met-list" class="metrics-list"></div>
+      </div>
+    </div>
+
+    <!-- PAINEL: IA RESUMO -->
     <div id="panel-ai" class="panel" style="bottom: 88px; right: 386px;">
       <div class="p-head anim-grad" data-drag="panel-ai">
         <span class="p-title">✨ Resumo IA • gpt-oss-20b</span>
@@ -415,7 +674,7 @@
       </div>
     </div>
 
-    <!-- PAINEL 3: VISUAIS -->
+    <!-- PAINEL: VISUAIS -->
     <div id="panel-vis" class="panel" style="bottom: 240px; right: 82px; width: 310px;">
       <div class="p-head anim-grad" data-drag="panel-vis">
         <span class="p-title">🎨 Visuais Tecnológicos</span>
@@ -429,6 +688,7 @@
       <button id="fab-main" class="fab-main anim-grad" title="Clique para abrir | Arraste para mover">✦</button>
       <div id="fab-stack" class="fab-stack">
         <button class="fab-sub active" data-toggle="panel-int" data-tip="Interações">📊</button>
+        <button class="fab-sub" data-toggle="panel-met" data-tip="Métricas">📈</button>
         <button class="fab-sub" data-toggle="panel-ai" data-tip="Resumo IA">✨</button>
         <button class="fab-sub" data-toggle="panel-vis" data-tip="Visuais">🎨</button>
       </div>
@@ -439,7 +699,7 @@
   const makeDraggable = (el, handle, onClickIfNoDrag) => {
     let startX, startY, origLeft, origTop, moved = false;
     handle.addEventListener('mousedown', (e) => {
-      if (e.target.closest('button.p-close')) return;
+      if (e.target.closest('button.p-close, button.p-icon-btn')) return;
       const rect = el.getBoundingClientRect();
       startX = e.clientX; startY = e.clientY;
       origLeft = rect.left; origTop = rect.top;
@@ -481,15 +741,75 @@
   });
 
   // ===== TOGGLE INDEPENDENTE DOS PAINÉIS =====
+  const togglePanelById = (id) => {
+    const panel = shadow.getElementById(id);
+    if (!panel) return;
+    const isOpen = panel.classList.toggle('open');
+    const subBtn = shadow.querySelector(`.fab-sub[data-toggle="${id}"]`);
+    if (subBtn) subBtn.classList.toggle('active', isOpen);
+    if (id === 'panel-met' && isOpen) syncMetricsAPI();
+  };
+
   shadow.querySelectorAll('[data-toggle]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const id = btn.dataset.toggle;
-      const panel = shadow.getElementById(id);
-      const isOpen = panel.classList.toggle('open');
-      const subBtn = shadow.querySelector(`.fab-sub[data-toggle="${id}"]`);
-      if (subBtn) subBtn.classList.toggle('active', isOpen);
-    });
+    btn.addEventListener('click', () => togglePanelById(btn.dataset.toggle));
   });
+
+  // ===== DASH PIP =====
+  const pipIframe = shadow.getElementById('pip-iframe');
+  shadow.getElementById('btn-open-pip').onclick = () => {
+    if (!pipLoaded) {
+      pipIframe.src = DASH_PIP_URL;
+      pipLoaded = true;
+    }
+    togglePanelById('panel-pip');
+  };
+  shadow.getElementById('btn-pip-reload').onclick = () => {
+    pipIframe.src = DASH_PIP_URL;
+    pipLoaded = true;
+  };
+  shadow.getElementById('btn-pip-ext').onclick = () => {
+    window.open(DASH_PIP_URL, '_blank', 'noopener,noreferrer');
+  };
+
+  // ===== RENDERIZAÇÃO DAS MÉTRICAS (BARRA DE VIDA) =====
+  const renderMetrics = () => {
+    const statusEl = shadow.getElementById('met-status');
+    const ptsEl = shadow.getElementById('met-pts');
+    const listEl = shadow.getElementById('met-list');
+
+    ptsEl.textContent = `💎 ${cachedMetrics.points ?? '--'} pts`;
+
+    if (!cachedMetrics.items || !cachedMetrics.items.length) {
+      statusEl.textContent = 'Buscando indicadores...';
+      listEl.innerHTML = '<div class="note" style="text-align:center;padding:24px 8px;">Aguardando dados da API do Genesys...</div>';
+      return;
+    }
+
+    statusEl.textContent = `${cachedMetrics.items.length} indicadores • ${cachedMetrics.updatedAt}`;
+    listEl.innerHTML = cachedMetrics.items.map((m) => `
+      <div class="life-card ${m.inTarget ? 'in-target' : ''}">
+        <div class="life-top">
+          <span class="life-title">${m.title}</span>
+          <span class="life-val ${m.inTarget ? 'ok' : ''}">${m.valueFormatted}</span>
+        </div>
+
+        <div class="life-bar-wrap">
+          <div class="life-bar">
+            ${m.segments.map(s => `<div class="life-seg ${s}"></div>`).join('')}
+          </div>
+          <div class="life-pin" style="left:${m.pct.toFixed(1)}%;" title="Você está aqui: ${m.valueFormatted}"></div>
+        </div>
+
+        <div class="life-scales">
+          <span>Mín: <strong>${m.minLbl}</strong></span>
+          <span>Méd/Alvo: <strong>${m.midLbl}</strong></span>
+          <span>Máx: <strong>${m.maxLbl}</strong></span>
+        </div>
+      </div>
+    `).join('');
+  };
+
+  shadow.getElementById('btn-met-sync').onclick = () => syncMetricsAPI();
 
   // ===== TEMAS =====
   const applyTheme = (key) => {
@@ -563,8 +883,12 @@
   };
 
   // ===== MONITORAMENTO (1s) =====
+  let tickCount = 0;
   window.__gcProInterval = setInterval(() => {
+    tickCount += 1;
     ensureCopyBothButton();
+
+    if (tickCount % 180 === 0) syncMetricsAPI();
 
     const active = detectActiveInteraction();
     const dot = shadow.getElementById('live-dot');
@@ -603,7 +927,6 @@
       saveInteractions();
     }
 
-    // Atualiza o cronômetro pequeno em cima do nome no card da lista lateral (Foto 1)
     updateCardTimerBadge(active.card, rec);
 
     dot.classList.add('live');
@@ -716,6 +1039,9 @@
     setTimeout(() => btn.textContent = 'Copiar Resumo', 1500);
   };
 
+  // ===== INICIALIZAÇÃO =====
   applyTheme(config.theme);
   renderInteractions();
+  renderMetrics();
+  syncMetricsAPI();
 })();
