@@ -6,7 +6,9 @@
   }
 
   // ===== CONFIGURAÇÕES E STORAGE =====
-  const TODAY_KEY = 'gc_pro_interactions_v3_' + new Date().toISOString().slice(0, 10);
+  const TODAY_STR = new Date().toISOString().slice(0, 10);
+  const TODAY_KEY = 'gc_pro_interactions_v3_' + TODAY_STR;
+  const ADJ_KEY = 'gc_pro_adjustments_v1_' + TODAY_STR;
   const CFG_KEY = 'gc_pro_config_v3';
   const METRICS_KEY = 'gc_pro_metrics_v3';
   const THRESHOLD_SEC = 70; // 1m 10s
@@ -45,7 +47,6 @@
     }
   };
 
-  // Regras de meta e tradução para os indicadores da API do Genesys
   const METRIC_META = {
     'Number of Interaction Answered': { label: 'Qtd. Interações Atendidas', type: 'high', min: 32, mid: 36, max: 40, scaleMax: 44 },
     'Number of Interaction': { label: 'Total de Interações', type: 'high', min: 32, mid: 36, max: 40, scaleMax: 44 },
@@ -64,18 +65,21 @@
 
   let config = Object.assign({
     theme: 'deepspace',
+    showClock: true,
     apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
     apiKey: '',
     model: 'openai/gpt-oss-20b'
   }, JSON.parse(localStorage.getItem(CFG_KEY) || '{}'));
 
   let interactions = JSON.parse(localStorage.getItem(TODAY_KEY) || '{}');
+  let adjustments = Object.assign({ chatOffset: 0, voiceOffset: 0 }, JSON.parse(localStorage.getItem(ADJ_KEY) || '{}'));
   let cachedMetrics = JSON.parse(localStorage.getItem(METRICS_KEY) || '{"updatedAt":null,"points":null,"items":[]}');
   let menuOpen = false;
   let pipLoaded = false;
 
   const saveConfig = () => localStorage.setItem(CFG_KEY, JSON.stringify(config));
   const saveInteractions = () => localStorage.setItem(TODAY_KEY, JSON.stringify(interactions));
+  const saveAdjustments = () => localStorage.setItem(ADJ_KEY, JSON.stringify(adjustments));
   const saveMetrics = () => localStorage.setItem(METRICS_KEY, JSON.stringify(cachedMetrics));
 
   // ===== PRIVACIDADE E UTILITÁRIOS =====
@@ -97,7 +101,12 @@
     .replace(/\b\d{2}\/\d{2}\/\d{4}\b/g, '[DATA_OCULTA]')
     .trim();
 
-  const fmtTime = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  const fmtTime = (s) => {
+    const sec = Math.max(0, Math.round(s || 0));
+    const m = Math.floor(sec / 60);
+    const r = sec % 60;
+    return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+  };
 
   const fmtMetricVal = (val, unitType) => {
     if (val === null || val === undefined || Number.isNaN(val)) return '-';
@@ -110,9 +119,7 @@
       if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
       return `${s}s`;
     }
-    if (unitType === 'Percent') {
-      return `${val.toFixed(1).replace('.', ',')}%`;
-    }
+    if (unitType === 'Percent') return `${val.toFixed(1).replace('.', ',')}%`;
     return String(Math.round(val));
   };
 
@@ -139,44 +146,27 @@
     if (!rule) {
       const pct = unitType === 'Percent' ? Math.max(2, Math.min(98, val)) : 50;
       return {
-        pct,
-        inTarget: false,
-        segments: ['seg-0', 'seg-1', 'seg-2', 'seg-3'],
-        minLbl: '0',
-        midLbl: unitType === 'Percent' ? '50%' : '-',
-        maxLbl: unitType === 'Percent' ? '100%' : '-'
+        pct, inTarget: false, segments: ['seg-0', 'seg-1', 'seg-2', 'seg-3'],
+        minLbl: '0', midLbl: unitType === 'Percent' ? '50%' : '-', maxLbl: unitType === 'Percent' ? '100%' : '-'
       };
     }
-
     const scaleMax = rule.scaleMax || rule.max * 1.2;
     const pct = Math.max(2, Math.min(98, (val / scaleMax) * 100));
 
     if (rule.type === 'high') {
       return {
-        pct,
-        inTarget: val >= rule.max,
-        segments: ['seg-0', 'seg-1', 'seg-2', 'seg-3'],
-        minLbl: fmtMetricVal(rule.min, unitType),
-        midLbl: fmtMetricVal(rule.mid, unitType),
-        maxLbl: fmtMetricVal(rule.max, unitType)
+        pct, inTarget: val >= rule.max, segments: ['seg-0', 'seg-1', 'seg-2', 'seg-3'],
+        minLbl: fmtMetricVal(rule.min, unitType), midLbl: fmtMetricVal(rule.mid, unitType), maxLbl: fmtMetricVal(rule.max, unitType)
       };
     }
-
     if (rule.type === 'low') {
       return {
-        pct,
-        inTarget: val <= rule.min,
-        segments: ['seg-3', 'seg-2', 'seg-1', 'seg-0'],
-        minLbl: fmtMetricVal(rule.min, unitType),
-        midLbl: fmtMetricVal(rule.mid, unitType),
-        maxLbl: fmtMetricVal(rule.max, unitType)
+        pct, inTarget: val <= rule.min, segments: ['seg-3', 'seg-2', 'seg-1', 'seg-0'],
+        minLbl: fmtMetricVal(rule.min, unitType), midLbl: fmtMetricVal(rule.mid, unitType), maxLbl: fmtMetricVal(rule.max, unitType)
       };
     }
-
     return {
-      pct,
-      inTarget: val >= rule.midLow && val <= rule.midHigh,
-      segments: ['seg-0', 'seg-2', 'seg-3', 'seg-2', 'seg-0'],
+      pct, inTarget: val >= rule.midLow && val <= rule.midHigh, segments: ['seg-0', 'seg-2', 'seg-3', 'seg-2', 'seg-0'],
       minLbl: fmtMetricVal(rule.min, unitType),
       midLbl: `${fmtMetricVal(rule.midLow, unitType)}–${fmtMetricVal(rule.midHigh, unitType)}`,
       maxLbl: fmtMetricVal(rule.max, unitType)
@@ -192,15 +182,13 @@
     }
 
     const hostApi = location.hostname.replace(/^apps?\./, 'api.');
-    const today = new Date().toISOString().slice(0, 10);
     const headers = { Authorization: 'Bearer ' + token };
-
     if (statusEl) statusEl.textContent = 'Atualizando indicadores...';
 
     try {
       const [valRes, ptsRes] = await Promise.all([
-        fetch(`https://${hostApi}/api/v2/gamification/scorecards/values/trends?startWorkday=${today}&endWorkday=${today}`, { headers }),
-        fetch(`https://${hostApi}/api/v2/gamification/scorecards/points/trends?startWorkday=${today}&endWorkday=${today}`, { headers })
+        fetch(`https://${hostApi}/api/v2/gamification/scorecards/values/trends?startWorkday=${TODAY_STR}&endWorkday=${TODAY_STR}`, { headers }),
+        fetch(`https://${hostApi}/api/v2/gamification/scorecards/points/trends?startWorkday=${TODAY_STR}&endWorkday=${TODAY_STR}`, { headers })
       ]);
 
       let points = cachedMetrics.points;
@@ -211,15 +199,12 @@
 
       if (valRes.ok) {
         const valData = await valRes.json();
-        const rawList = valData?.results || [];
-
-        const items = rawList.map((r) => {
+        const items = (valData?.results || []).map((r) => {
           const rawName = r.metricDefinition?.name || 'Indicador';
           const rule = METRIC_META[rawName];
           const val = r.average ?? r.trend?.[0]?.value ?? 0;
           const unitType = r.unitType || 'Number';
           const bar = evaluateLifeBar(val, unitType, rule);
-
           return {
             rawName,
             title: rule ? rule.label : rawName,
@@ -242,7 +227,7 @@
         saveMetrics();
         renderMetrics();
       }
-    } catch (e) {
+    } catch {
       if (statusEl) statusEl.textContent = 'Erro ao atualizar. Clique em ↻.';
     }
   };
@@ -253,10 +238,14 @@
     if (!list) return null;
     let card = list.querySelector('[aria-selected="true"], .selected, .active');
     if (!card && rawName) {
-      const candidates = Array.from(list.children);
-      card = candidates.find(el => el.textContent && el.textContent.includes(rawName.slice(0, 12)));
+      card = Array.from(list.children).find(el => el.textContent && el.textContent.includes(rawName.slice(0, 12)));
     }
     return card || null;
+  };
+
+  const getRosterTextSnapshot = () => {
+    const list = document.querySelector('.acd-interactions-list .interactions');
+    return list ? list.textContent || '' : '';
   };
 
   const detectActiveInteraction = () => {
@@ -293,9 +282,7 @@
   // ===== INJEÇÃO 1: CRONÔMETRO PEQUENO NO CARD LATERAL =====
   const updateCardTimerBadge = (card, rec) => {
     if (!card) return;
-    if (getComputedStyle(card).position === 'static') {
-      card.style.position = 'relative';
-    }
+    if (getComputedStyle(card).position === 'static') card.style.position = 'relative';
     let badge = card.querySelector('.gc-pro-card-timer');
     if (!badge) {
       badge = document.createElement('span');
@@ -345,7 +332,7 @@
         try {
           const clip = await navigator.clipboard.readText();
           if (clip && /^https?:\/\//i.test(clip.trim())) url = clip.trim();
-        } catch (_) {}
+        } catch {}
       }
 
       await navigator.clipboard.writeText(`${name}\n${url}`);
@@ -389,6 +376,19 @@
         animation: gradMove 9s ease infinite;
       }
 
+      /* RELÓGIO FLUTUANTE ARRASTÁVEL */
+      .clock-pill {
+        position: fixed; top: 14px; right: 22px; pointer-events: auto;
+        background: var(--bg); color: var(--text); border: 1px solid var(--accent);
+        border-radius: 99px; padding: 6px 13px; display: flex; align-items: center; gap: 8px;
+        box-shadow: 0 6px 20px rgba(0,0,0,.45), 0 0 12px rgba(0,0,0,.2);
+        cursor: grab; user-select: none; font-variant-numeric: tabular-nums;
+      }
+      .clock-pill:active { cursor: grabbing; }
+      .clock-pill.hidden { display: none; }
+      .clock-orb { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+      .clock-time { font-size: 13px; font-weight: 800; letter-spacing: .8px; color: var(--text); }
+
       /* DOCK CIRCULAR EMPILHADO */
       .fab-wrap {
         position: fixed; bottom: 22px; right: 22px; pointer-events: auto;
@@ -428,7 +428,7 @@
 
       /* PAINÉIS ARRASTÁVEIS E REDIMENSIONÁVEIS */
       .panel {
-        position: fixed; width: 350px; height: 430px; min-width: 240px; min-height: 220px;
+        position: fixed; width: 350px; height: 460px; min-width: 240px; min-height: 220px;
         max-width: 92vw; max-height: 90vh; pointer-events: auto;
         background: var(--bg); color: var(--text); border: 1px solid var(--border);
         border-radius: 14px; box-shadow: 0 16px 40px rgba(0,0,0,.5);
@@ -437,7 +437,7 @@
       .panel.open { display: flex; }
       #panel-int, #panel-pip, #panel-met { resize: both; }
       #panel-ai { height: auto; max-height: 540px; }
-      #panel-vis { height: auto; }
+      #panel-vis, #panel-cfg { height: auto; width: 320px; }
       #panel-pip { width: 460px; height: 420px; }
       #panel-met { width: 390px; height: 500px; }
 
@@ -481,6 +481,15 @@
       .stat-sq .num { font-size: 24px; font-weight: 800; line-height: 1; color: var(--text); }
       .stat-sq.primary .num { color: var(--accent); }
       .stat-sq .lbl { font-size: 10px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+
+      /* CAIXA DO TMA */
+      .tma-box {
+        background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+        padding: 8px 12px; display: flex; justify-content: space-between; align-items: center;
+        flex-shrink: 0;
+      }
+      .tma-lbl { font-size: 11px; font-weight: 700; color: var(--text); text-transform: uppercase; letter-spacing: .4px; }
+      .tma-num { font-size: 17px; font-weight: 800; color: var(--accent); font-variant-numeric: tabular-nums; }
 
       .list { display: flex; flex-direction: column; gap: 6px; flex: 1; min-height: 56px; overflow-y: auto; }
       .item {
@@ -543,6 +552,15 @@
       }
       .life-scales span strong { color: var(--text); font-weight: 600; }
 
+      /* CONFIGURAÇÕES */
+      .cfg-group {
+        background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+        padding: 10px 11px; display: flex; flex-direction: column; gap: 8px;
+      }
+      .cfg-title { font-size: 11.5px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: .4px; }
+      .cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .field-lbl { font-size: 11px; color: var(--muted); display: block; margin-bottom: 4px; }
+
       /* MINI TELA DASH PIP */
       .pip-frame { width: 100%; height: 100%; border: 0; background: #fff; flex: 1; }
 
@@ -558,8 +576,8 @@
       .row { display: flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
 
       textarea, input {
-        width: 100%; background: var(--surface); color: var(--text); border: 1px solid var(--border);
-        border-radius: 8px; padding: 8px 10px; font-size: 12px; font-family: inherit; resize: vertical;
+        width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; padding: 7px 9px; font-size: 12px; font-family: inherit; resize: vertical;
       }
       textarea:focus, input:focus { outline: none; border-color: var(--accent); }
       .note { font-size: 11px; color: var(--muted); line-height: 1.4; }
@@ -575,6 +593,12 @@
       .preview-orb { width: 26px; height: 26px; border-radius: 50%; border: 1px solid rgba(255,255,255,.25); }
       details summary { font-size: 11px; color: var(--muted); cursor: pointer; margin-bottom: 6px; }
     </style>
+
+    <!-- RELÓGIO FLUTUANTE (H:M:S) -->
+    <div id="gc-clock" class="clock-pill" title="Arraste para mover o relógio">
+      <span class="clock-orb anim-grad"></span>
+      <span id="gc-clock-time" class="clock-time">00:00:00</span>
+    </div>
 
     <!-- PAINEL 1: INTERAÇÕES -->
     <div id="panel-int" class="panel open" style="bottom: 88px; right: 22px;">
@@ -605,6 +629,15 @@
           </div>
         </div>
 
+        <!-- CONTADOR DE TMA -->
+        <div class="tma-box" title="(Fala/Interação + Espera/Hold + Tabulação pós-atendimento) ÷ Total de atendimentos finalizados">
+          <div>
+            <span class="tma-lbl">TMA Calculado</span>
+            <small id="tma-sub" class="note" style="display:block;font-size:10px;">0 atendimentos finalizados</small>
+          </div>
+          <strong id="tma-val" class="tma-num">00:00</strong>
+        </div>
+
         <div id="int-list" class="list"></div>
 
         <div class="row" style="justify-content: space-between; border-top: 1px solid var(--border); padding-top: 8px;">
@@ -630,7 +663,7 @@
       <iframe id="pip-iframe" class="pip-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>
     </div>
 
-    <!-- PAINEL: MÉTRICAS (API DIRETA + BARRA DE VIDA) -->
+    <!-- PAINEL: MÉTRICAS -->
     <div id="panel-met" class="panel" style="bottom: 88px; right: 386px;">
       <div class="p-head anim-grad" data-drag="panel-met">
         <span class="p-title">Métricas</span>
@@ -675,12 +708,53 @@
     </div>
 
     <!-- PAINEL: VISUAIS -->
-    <div id="panel-vis" class="panel" style="bottom: 240px; right: 82px; width: 310px;">
+    <div id="panel-vis" class="panel" style="bottom: 240px; right: 82px;">
       <div class="p-head anim-grad" data-drag="panel-vis">
         <span class="p-title">🎨 Visuais Tecnológicos</span>
         <button class="p-close" data-toggle="panel-vis">✕</button>
       </div>
       <div class="p-body" id="theme-list"></div>
+    </div>
+
+    <!-- PAINEL: CONFIGURAÇÕES (ENGRENAGEM) -->
+    <div id="panel-cfg" class="panel" style="bottom: 200px; right: 82px;">
+      <div class="p-head anim-grad" data-drag="panel-cfg">
+        <span class="p-title">⚙️ Configurações</span>
+        <button class="p-close" data-toggle="panel-cfg">✕</button>
+      </div>
+      <div class="p-body">
+        <div class="cfg-group">
+          <span class="cfg-title">Editar Contagem Manual</span>
+          <div class="cfg-grid">
+            <div>
+              <label class="field-lbl" for="cfg-chat-num">Interações Chat</label>
+              <input id="cfg-chat-num" type="number" min="0" value="0" />
+            </div>
+            <div>
+              <label class="field-lbl" for="cfg-voice-num">Interações Voz</label>
+              <input id="cfg-voice-num" type="number" min="0" value="0" />
+            </div>
+          </div>
+          <div class="row" style="justify-content: space-between;">
+            <span id="cfg-msg" class="note">O Total soma Chat + Voz.</span>
+            <button id="btn-cfg-apply" class="btn anim-grad sm">Aplicar</button>
+          </div>
+        </div>
+
+        <div class="cfg-group">
+          <span class="cfg-title">Relógio em Tela</span>
+          <div class="row" style="justify-content: space-between;">
+            <span class="note">Exibir relógio flutuante (h:m:s)</span>
+            <button id="btn-toggle-clock" class="btn sec sm">Ocultar</button>
+          </div>
+        </div>
+
+        <div class="cfg-group">
+          <span class="cfg-title">Cálculo de TMA</span>
+          <span class="note">Fórmula: (Interação + Espera + Tabulação) ÷ Atendimentos encerrados e tabulados.</span>
+          <button id="btn-reset-tma" class="btn sec sm" style="align-self:flex-start;">Zerar Histórico de TMA</button>
+        </div>
+      </div>
     </div>
 
     <!-- BOTÃO PRINCIPAL REDONDO + PILHA EXPANSÍVEL -->
@@ -691,11 +765,12 @@
         <button class="fab-sub" data-toggle="panel-met" data-tip="Métricas">📈</button>
         <button class="fab-sub" data-toggle="panel-ai" data-tip="Resumo IA">✨</button>
         <button class="fab-sub" data-toggle="panel-vis" data-tip="Visuais">🎨</button>
+        <button class="fab-sub" data-toggle="panel-cfg" data-tip="Configurações">⚙️</button>
       </div>
     </div>
   `;
 
-  // ===== ARRASTAR (PAINÉIS E BOTÕES) =====
+  // ===== ARRASTAR (PAINÉIS, BOTÕES E RELÓGIO) =====
   const makeDraggable = (el, handle, onClickIfNoDrag) => {
     let startX, startY, origLeft, origTop, moved = false;
     handle.addEventListener('mousedown', (e) => {
@@ -731,6 +806,10 @@
     makeDraggable(shadow.getElementById(head.dataset.drag), head);
   });
 
+  const clockEl = shadow.getElementById('gc-clock');
+  const clockTimeEl = shadow.getElementById('gc-clock-time');
+  makeDraggable(clockEl, clockEl);
+
   const fabWrap = shadow.getElementById('fab-wrap');
   const fabMain = shadow.getElementById('fab-main');
   const fabStack = shadow.getElementById('fab-stack');
@@ -748,11 +827,60 @@
     const subBtn = shadow.querySelector(`.fab-sub[data-toggle="${id}"]`);
     if (subBtn) subBtn.classList.toggle('active', isOpen);
     if (id === 'panel-met' && isOpen) syncMetricsAPI();
+    if (id === 'panel-cfg' && isOpen) syncConfigInputs();
   };
 
   shadow.querySelectorAll('[data-toggle]').forEach(btn => {
     btn.addEventListener('click', () => togglePanelById(btn.dataset.toggle));
   });
+
+  // ===== CONFIGURAÇÕES (EDIÇÃO MANUAL + RELÓGIO + TMA) =====
+  const getAutoCounts = () => {
+    const valid = Object.values(interactions).filter(v => v.counted);
+    return {
+      chat: valid.filter(v => v.channel === 'chat').length,
+      voice: valid.filter(v => v.channel === 'voice').length
+    };
+  };
+
+  const syncConfigInputs = () => {
+    const auto = getAutoCounts();
+    shadow.getElementById('cfg-chat-num').value = Math.max(0, auto.chat + (adjustments.chatOffset || 0));
+    shadow.getElementById('cfg-voice-num').value = Math.max(0, auto.voice + (adjustments.voiceOffset || 0));
+    shadow.getElementById('btn-toggle-clock').textContent = config.showClock ? 'Ocultar' : 'Mostrar';
+    clockEl.classList.toggle('hidden', !config.showClock);
+  };
+
+  shadow.getElementById('btn-cfg-apply').onclick = () => {
+    const auto = getAutoCounts();
+    const desiredChat = Math.max(0, parseInt(shadow.getElementById('cfg-chat-num').value, 10) || 0);
+    const desiredVoice = Math.max(0, parseInt(shadow.getElementById('cfg-voice-num').value, 10) || 0);
+    adjustments.chatOffset = desiredChat - auto.chat;
+    adjustments.voiceOffset = desiredVoice - auto.voice;
+    saveAdjustments();
+    renderInteractions();
+    const msg = shadow.getElementById('cfg-msg');
+    msg.textContent = 'Números atualizados ✓';
+    setTimeout(() => { msg.textContent = 'O Total soma Chat + Voz.'; }, 2000);
+  };
+
+  shadow.getElementById('btn-toggle-clock').onclick = () => {
+    config.showClock = !config.showClock;
+    saveConfig();
+    syncConfigInputs();
+  };
+
+  shadow.getElementById('btn-reset-tma').onclick = () => {
+    if (confirm('Zerar apenas os tempos acumulados de TMA de hoje?')) {
+      Object.values(interactions).forEach(v => {
+        v.tmaSeconds = 0;
+        v.tmaFinalized = false;
+        v.missingTicks = 0;
+      });
+      saveInteractions();
+      renderInteractions();
+    }
+  };
 
   // ===== DASH PIP =====
   const pipIframe = shadow.getElementById('pip-iframe');
@@ -771,7 +899,7 @@
     window.open(DASH_PIP_URL, '_blank', 'noopener,noreferrer');
   };
 
-  // ===== RENDERIZAÇÃO DAS MÉTRICAS (BARRA DE VIDA) =====
+  // ===== RENDERIZAÇÃO DAS MÉTRICAS =====
   const renderMetrics = () => {
     const statusEl = shadow.getElementById('met-status');
     const ptsEl = shadow.getElementById('met-pts');
@@ -792,14 +920,12 @@
           <span class="life-title">${m.title}</span>
           <span class="life-val ${m.inTarget ? 'ok' : ''}">${m.valueFormatted}</span>
         </div>
-
         <div class="life-bar-wrap">
           <div class="life-bar">
             ${m.segments.map(s => `<div class="life-seg ${s}"></div>`).join('')}
           </div>
           <div class="life-pin" style="left:${m.pct.toFixed(1)}%;" title="Você está aqui: ${m.valueFormatted}"></div>
         </div>
-
         <div class="life-scales">
           <span>Mín: <strong>${m.minLbl}</strong></span>
           <span>Méd/Alvo: <strong>${m.midLbl}</strong></span>
@@ -846,16 +972,26 @@
     });
   };
 
-  // ===== RENDERIZAÇÃO DE INTERAÇÕES =====
+  // ===== RENDERIZAÇÃO DE INTERAÇÕES + TMA =====
   const renderInteractions = () => {
-    const valid = Object.entries(interactions).filter(([, v]) => v.counted);
-    const chats = valid.filter(([, v]) => v.channel === 'chat').length;
-    const voices = valid.filter(([, v]) => v.channel === 'voice').length;
+    const auto = getAutoCounts();
+    const chats = Math.max(0, auto.chat + (adjustments.chatOffset || 0));
+    const voices = Math.max(0, auto.voice + (adjustments.voiceOffset || 0));
+    const total = chats + voices;
 
-    shadow.getElementById('sq-total').textContent = valid.length;
+    shadow.getElementById('sq-total').textContent = total;
     shadow.getElementById('sq-chat').textContent = chats;
     shadow.getElementById('sq-voice').textContent = voices;
 
+    // Cálculo do TMA: (Interação + Espera + Tabulação) ÷ Total de atendimentos finalizados
+    const finalizedForTma = Object.values(interactions).filter(v => v.tmaFinalized && (v.tmaSeconds || 0) >= 10);
+    const totalTmaSec = finalizedForTma.reduce((acc, v) => acc + (v.tmaSeconds || 0), 0);
+    const avgTma = finalizedForTma.length ? Math.round(totalTmaSec / finalizedForTma.length) : 0;
+
+    shadow.getElementById('tma-val').textContent = fmtTime(avgTma);
+    shadow.getElementById('tma-sub').textContent = `${finalizedForTma.length} ${finalizedForTma.length === 1 ? 'atendimento finalizado' : 'atendimentos finalizados'}`;
+
+    const valid = Object.entries(interactions).filter(([, v]) => v.counted);
     const list = shadow.getElementById('int-list');
     if (!valid.length) {
       list.innerHTML = '<div class="note" style="text-align:center;padding:12px 0;">Nenhuma interação atingiu 1m 10s hoje.</div>';
@@ -867,79 +1003,113 @@
         <div class="item">
           <div style="min-width:0;">
             <strong title="${v.name}">${v.channel === 'voice' ? '📞' : '💬'} ${v.name}</strong>
-            <small>${v.channel === 'voice' ? 'Voz' : 'Chat'} • ${v.countedAt}</small>
+            <small>${v.channel === 'voice' ? 'Voz' : 'Chat'} • ${v.countedAt}${v.tmaFinalized ? ' • TMA ' + fmtTime(v.tmaSeconds) : ' • Em andamento'}</small>
           </div>
           <span class="check-badge" title="Contabilizada">✓</span>
         </div>`).join('');
   };
 
   shadow.getElementById('btn-clear-int').onclick = () => {
-    if (confirm('Zerar a contagem de interações de hoje?')) {
+    if (confirm('Zerar a contagem de interações e TMA de hoje?')) {
       interactions = {};
+      adjustments = { chatOffset: 0, voiceOffset: 0 };
       saveInteractions();
+      saveAdjustments();
       document.querySelectorAll('.gc-pro-card-timer').forEach(el => el.remove());
       renderInteractions();
+      syncConfigInputs();
     }
   };
 
-  // ===== MONITORAMENTO (1s) =====
+  // ===== MONITORAMENTO (1s): RELÓGIO + INTERAÇÕES + TMA =====
+  const updateClock = () => {
+    clockTimeEl.textContent = new Date().toLocaleTimeString('pt-BR', {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+  };
+
   let tickCount = 0;
   window.__gcProInterval = setInterval(() => {
     tickCount += 1;
+    updateClock();
     ensureCopyBothButton();
 
     if (tickCount % 180 === 0) syncMetricsAPI();
 
     const active = detectActiveInteraction();
+    const rosterText = getRosterTextSnapshot();
     const dot = shadow.getElementById('live-dot');
     const lbl = shadow.getElementById('live-label');
     const tmr = shadow.getElementById('live-timer');
 
-    if (!active) {
+    // Registra ou atualiza a interação ativa
+    if (active) {
+      if (!interactions[active.key]) {
+        interactions[active.key] = {
+          name: active.name,
+          rawName: active.rawName,
+          channel: active.channel,
+          seconds: 0,
+          counted: false,
+          countedAt: null,
+          countedTs: 0,
+          tmaSeconds: 0,
+          tmaFinalized: false,
+          missingTicks: 0
+        };
+      }
+      const rec = interactions[active.key];
+      rec.name = active.name;
+      rec.rawName = active.rawName || rec.rawName;
+
+      if (!rec.counted) {
+        rec.seconds += 1;
+        if (rec.seconds >= THRESHOLD_SEC) {
+          rec.counted = true;
+          rec.countedAt = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+          rec.countedTs = Date.now();
+        }
+      }
+
+      updateCardTimerBadge(active.card, rec);
+
+      dot.classList.add('live');
+      if (rec.counted) {
+        lbl.textContent = `${active.channel === 'voice' ? '📞' : '💬'} ${active.name}`;
+        tmr.textContent = '✓';
+        tmr.classList.add('done');
+      } else {
+        lbl.textContent = `${active.channel === 'voice' ? '📞' : '💬'} ${active.name}`;
+        tmr.textContent = fmtTime(rec.seconds);
+        tmr.classList.remove('done');
+      }
+    } else {
       dot.classList.remove('live');
       tmr.classList.remove('done');
       lbl.textContent = 'Pausado / Sem conversa ativa';
       tmr.textContent = '00:00';
-      return;
     }
 
-    if (!interactions[active.key]) {
-      interactions[active.key] = {
-        name: active.name,
-        channel: active.channel,
-        seconds: 0,
-        counted: false,
-        countedAt: null,
-        countedTs: 0
-      };
-    }
+    // Atualiza o TMA de todos os atendimentos em andamento (Fala/Interação + Hold + Tabulação)
+    // Para automaticamente quando o chamado é encerrado e tabulado (sai da lista de conversas ativas)
+    Object.entries(interactions).forEach(([key, rec]) => {
+      if (rec.tmaFinalized) return;
+      const isCurrentlySelected = active && active.key === key;
+      const hint = (rec.rawName || rec.name || '').slice(0, 12);
+      const stillInRoster = hint && rosterText.includes(hint);
 
-    const rec = interactions[active.key];
-    rec.name = active.name;
-
-    if (!rec.counted) {
-      rec.seconds += 1;
-      if (rec.seconds >= THRESHOLD_SEC) {
-        rec.counted = true;
-        rec.countedAt = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-        rec.countedTs = Date.now();
+      if (isCurrentlySelected || stillInRoster) {
+        rec.tmaSeconds = (rec.tmaSeconds || 0) + 1;
+        rec.missingTicks = 0;
+      } else {
+        rec.missingTicks = (rec.missingTicks || 0) + 1;
+        if (rec.missingTicks >= 3) {
+          rec.tmaFinalized = true;
+        }
       }
-      saveInteractions();
-    }
+    });
 
-    updateCardTimerBadge(active.card, rec);
-
-    dot.classList.add('live');
-    if (rec.counted) {
-      lbl.textContent = `${active.channel === 'voice' ? '📞' : '💬'} ${active.name}`;
-      tmr.textContent = '✓';
-      tmr.classList.add('done');
-    } else {
-      lbl.textContent = `${active.channel === 'voice' ? '📞' : '💬'} ${active.name}`;
-      tmr.textContent = fmtTime(rec.seconds);
-      tmr.classList.remove('done');
-    }
-
+    saveInteractions();
     renderInteractions();
   }, 1000);
 
@@ -1041,6 +1211,8 @@
 
   // ===== INICIALIZAÇÃO =====
   applyTheme(config.theme);
+  updateClock();
+  syncConfigInputs();
   renderInteractions();
   renderMetrics();
   syncMetricsAPI();
