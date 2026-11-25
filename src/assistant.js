@@ -1,0 +1,1 @@
+javascript:(()=>{const s=document.createElement('script');s.src='[https://cdn.jsdelivr.net/gh/SEU_USUARIO/SEU_REPO@main/src/assistant.js?t='+Date.now();document.head.appendChild(s](https://cdn.jsdelivr.net/gh/SEU_USUARIO/SEU_REPO@main/src/assistant.js?t='+Date.now();document.head.appendChild(s));})();
