@@ -5,13 +5,16 @@
     document.querySelectorAll('.gc-pro-card-timer, #gc-pro-copy-both-btn').forEach(el => el.remove());
   }
 
-  // ===== CONFIGURAÇÕES E STORAGE =====
-  const TODAY_STR = new Date().toISOString().slice(0, 10);
+  // ===== CONFIGURAÇÕES E STORAGE (DATA LOCAL) =====
+  const nowDate = new Date();
+  const TODAY_STR = `${nowDate.getFullYear()}-${String(nowDate.getMonth() + 1).padStart(2, '0')}-${String(nowDate.getDate()).padStart(2, '0')}`;
   const TODAY_KEY = 'gc_pro_interactions_v3_' + TODAY_STR;
   const ADJ_KEY = 'gc_pro_adjustments_v1_' + TODAY_STR;
   const CFG_KEY = 'gc_pro_config_v3';
   const METRICS_KEY = 'gc_pro_metrics_v3';
   const THRESHOLD_SEC = 70; // 1m 10s
+  const RELOAD_GRACE_MS = 20 * 60 * 1000;
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   const DASH_PIP_URL = 'https://script.google.com/a/macros/grupobrisanet.com.br/s/AKfycbysdYRZyX0strR8XbMVoc2UEKB6mHGzD8iugx1-O8_NFRkZJeiiulLpIlv4gA1fANp2/exec';
 
   const THEMES = {
@@ -44,6 +47,12 @@
       bg: '#14110f', surface: '#1f1a16', border: '#3d3126', text: '#faf3eb', muted: '#b5a291',
       grad: 'linear-gradient(135deg, #451a03, #d97706, #ea580c, #451a03)',
       accent: '#f59e0b', success: '#22c55e', danger: '#ef4444'
+    },
+    eclipse: {
+      name: 'Eclipse Mono', desc: 'Degradê minimalista de branco para preto',
+      bg: '#0d0d0f', surface: '#17171b', border: '#323238', text: '#f4f4f5', muted: '#a1a1aa',
+      grad: 'linear-gradient(135deg, #ffffff, #71717a, #18181b, #000000)',
+      accent: '#e4e4e7', success: '#22c55e', danger: '#ef4444'
     }
   };
 
@@ -92,14 +101,18 @@
     return 'ATD-' + (h >>> 0).toString(36).toUpperCase().slice(0, 6);
   };
 
-  const scrubPII = (text) => (text || '')
-    .replace(/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g, '[CPF_OCULTO]')
-    .replace(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g, '[CNPJ_OCULTO]')
-    .replace(/\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b/g, '[TEL_OCULTO]')
-    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}/gi, '[EMAIL_OCULTO]')
-    .replace(/\b\d{5}-?\d{3}\b/g, '[CEP_OCULTO]')
-    .replace(/\b\d{2}\/\d{2}\/\d{4}\b/g, '[DATA_OCULTA]')
-    .trim();
+  const scrubPII = (text, keepPhone = false) => {
+    let out = (text || '')
+      .replace(/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g, '[CPF_OCULTO]')
+      .replace(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g, '[CNPJ_OCULTO]')
+      .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}/gi, '[EMAIL_OCULTO]')
+      .replace(/\b\d{5}-?\d{3}\b/g, '[CEP_OCULTO]')
+      .replace(/\b\d{2}\/\d{2}\/\d{4}\b/g, '[DATA_OCULTA]');
+    if (!keepPhone) {
+      out = out.replace(/\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b/g, '[TEL_OCULTO]');
+    }
+    return out.trim();
+  };
 
   const fmtTime = (s) => {
     const sec = Math.max(0, Math.round(s || 0));
@@ -232,7 +245,7 @@
     }
   };
 
-  // ===== DETECÇÃO GENESYS (CARD LATERAL + CABEÇALHO) =====
+  // ===== DETECÇÃO GENESYS À PROVA DE F5 =====
   const findSelectedRosterCard = (rawName) => {
     const list = document.querySelector('.acd-interactions-list .interactions');
     if (!list) return null;
@@ -246,6 +259,32 @@
   const getRosterTextSnapshot = () => {
     const list = document.querySelector('.acd-interactions-list .interactions');
     return list ? list.textContent || '' : '';
+  };
+
+  const extractConversationUuid = (card, container) => {
+    const fromUrl = (window.location.hash + ' ' + window.location.pathname).match(UUID_RE);
+    if (fromUrl) return fromUrl[0].toLowerCase();
+
+    for (const el of [card, container].filter(Boolean)) {
+      for (const attr of Array.from(el.attributes || [])) {
+        if (/conv|interaction|id/i.test(attr.name)) {
+          const m = (attr.value || '').match(UUID_RE);
+          if (m) return m[0].toLowerCase();
+        }
+      }
+      const nested = el.querySelector('[data-conversation-id], [data-interaction-id]');
+      if (nested) {
+        const val = nested.getAttribute('data-conversation-id') || nested.getAttribute('data-interaction-id') || '';
+        const m = val.match(UUID_RE);
+        if (m) return m[0].toLowerCase();
+      }
+    }
+    return null;
+  };
+
+  const normalizeClientSig = (rawName, channel) => {
+    const norm = (rawName || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    return norm ? hashStr(`${channel}::${norm}`) : null;
   };
 
   const detectActiveInteraction = () => {
@@ -262,21 +301,83 @@
     const iconName = (guxIcon ? guxIcon.getAttribute('icon-name') : '') || '';
     const iconClass = iconWrap ? iconWrap.className : '';
     const isVoice = /phone|call|voice|audio/i.test(iconName + ' ' + iconClass);
+    const channel = isVoice ? 'voice' : 'chat';
 
-    const uuidMatch = window.location.hash.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
     const card = findSelectedRosterCard(rawName);
-    const domHint = card ? (card.getAttribute('data-conversation-id') || card.getAttribute('id') || '') : '';
+    const convUuid = extractConversationUuid(card, container);
+    const clientSig = normalizeClientSig(rawName, channel);
 
-    const uniqueSeed = uuidMatch ? uuidMatch[0] : (domHint || rawName);
-    if (!uniqueSeed) return null;
+    if (!convUuid && !rawName) return null;
 
-    return {
-      key: hashStr(uniqueSeed),
-      name: cleanName,
-      rawName,
-      card,
-      channel: isVoice ? 'voice' : 'chat'
+    return { convUuid, clientSig, name: cleanName, rawName, card, channel };
+  };
+
+  const resolveInteractionRecord = (active) => {
+    const now = Date.now();
+
+    if (active.convUuid) {
+      const exactKey = hashStr('uuid::' + active.convUuid);
+      if (interactions[exactKey]) {
+        const rec = interactions[exactKey];
+        rec.tmaFinalized = false;
+        rec.missingTicks = 0;
+        return { key: exactKey, rec };
+      }
+      const byUuid = Object.entries(interactions).find(([, r]) => r.convUuid && r.convUuid === active.convUuid);
+      if (byUuid) {
+        byUuid[1].tmaFinalized = false;
+        byUuid[1].missingTicks = 0;
+        return { key: byUuid[0], rec: byUuid[1] };
+      }
+    }
+
+    if (active.clientSig) {
+      const normRaw = (active.rawName || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const candidates = Object.entries(interactions)
+        .filter(([, r]) => {
+          const sameClient =
+            (r.clientSig && r.clientSig === active.clientSig) ||
+            (r.channel === active.channel && r.rawName && r.rawName.toLowerCase().replace(/\s+/g, ' ').trim() === normRaw) ||
+            (r.channel === active.channel && r.name && r.name === active.name);
+
+          if (!sameClient) return false;
+          if (active.convUuid && r.convUuid && active.convUuid !== r.convUuid) return false;
+
+          const lastSeen = r.lastSeenTs || r.countedTs || 0;
+          return !r.tmaFinalized || (now - lastSeen <= RELOAD_GRACE_MS);
+        })
+        .sort((a, b) => (b[1].lastSeenTs || b[1].countedTs || 0) - (a[1].lastSeenTs || a[1].countedTs || 0));
+
+      if (candidates.length) {
+        const [foundKey, foundRec] = candidates[0];
+        if (active.convUuid && !foundRec.convUuid) foundRec.convUuid = active.convUuid;
+        if (!foundRec.clientSig) foundRec.clientSig = active.clientSig;
+        foundRec.tmaFinalized = false;
+        foundRec.missingTicks = 0;
+        return { key: foundKey, rec: foundRec };
+      }
+    }
+
+    const newKey = active.convUuid
+      ? hashStr('uuid::' + active.convUuid)
+      : hashStr(`${active.channel}::${active.rawName || active.name}::${now}`);
+
+    interactions[newKey] = {
+      name: active.name,
+      rawName: active.rawName,
+      channel: active.channel,
+      convUuid: active.convUuid || null,
+      clientSig: active.clientSig || null,
+      seconds: 0,
+      counted: false,
+      countedAt: null,
+      countedTs: 0,
+      lastSeenTs: now,
+      tmaSeconds: 0,
+      tmaFinalized: false,
+      missingTicks: 0
     };
+    return { key: newKey, rec: interactions[newKey] };
   };
 
   // ===== INJEÇÃO 1: CRONÔMETRO PEQUENO NO CARD LATERAL =====
@@ -370,10 +471,15 @@
         0%, 100% { box-shadow: 0 0 0 2px rgba(255,255,255,.85), 0 0 8px var(--accent); }
         50% { box-shadow: 0 0 0 3px #fff, 0 0 14px var(--accent); }
       }
+      @keyframes recBlink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: .45; }
+      }
       .anim-grad {
         background: var(--grad);
         background-size: 260% 260%;
         animation: gradMove 9s ease infinite;
+        text-shadow: 0 1px 3px rgba(0,0,0,.72);
       }
 
       /* RELÓGIO FLUTUANTE ARRASTÁVEL */
@@ -436,7 +542,7 @@
       }
       .panel.open { display: flex; }
       #panel-int, #panel-pip, #panel-met { resize: both; }
-      #panel-ai { height: auto; max-height: 540px; }
+      #panel-ai { height: auto; max-height: 620px; width: 380px; }
       #panel-vis, #panel-cfg { height: auto; width: 320px; }
       #panel-pip { width: 460px; height: 420px; }
       #panel-met { width: 390px; height: 500px; }
@@ -450,10 +556,10 @@
       .p-title { font-size: 12.5px; font-weight: 700; letter-spacing: .3px; }
       .p-head-actions { display: flex; gap: 6px; align-items: center; }
       .p-close, .p-icon-btn {
-        background: rgba(0,0,0,.25); border: none; color: #fff; width: 22px; height: 22px;
+        background: rgba(0,0,0,.35); border: none; color: #fff; width: 22px; height: 22px;
         border-radius: 50%; cursor: pointer; font-size: 12px; display: grid; place-items: center;
       }
-      .p-close:hover, .p-icon-btn:hover { background: rgba(0,0,0,.45); }
+      .p-close:hover, .p-icon-btn:hover { background: rgba(0,0,0,.6); }
       .p-body {
         padding: 12px 14px; flex: 1; min-height: 0; overflow-y: auto;
         display: flex; flex-direction: column; gap: 10px;
@@ -504,7 +610,7 @@
         color: var(--success); font-size: 12px; font-weight: 800; flex-shrink: 0;
       }
 
-      /* MÉTRICAS COM BARRINHA DE VIDA ADAPTADA AO VISUAL */
+      /* MÉTRICAS */
       .met-summary-bar {
         display: flex; justify-content: space-between; align-items: center;
         background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
@@ -552,6 +658,15 @@
       }
       .life-scales span strong { color: var(--text); font-weight: 600; }
 
+      /* ADA IA */
+      .rec-status {
+        background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+        padding: 7px 10px; font-size: 11px; color: var(--muted);
+        display: flex; justify-content: space-between; align-items: center; gap: 6px;
+      }
+      .rec-status.active { border-color: var(--danger); color: var(--text); }
+      .rec-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); display: inline-block; margin-right: 5px; animation: recBlink 1s infinite; }
+
       /* CONFIGURAÇÕES */
       .cfg-group {
         background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
@@ -569,9 +684,9 @@
         font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity .15s;
       }
       .btn:hover { opacity: .9; }
-      .btn.sec { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+      .btn.sec { background: var(--surface); color: var(--text); border: 1px solid var(--border); text-shadow: none; }
       .btn.sec:hover { border-color: var(--accent); }
-      .btn.rec { background: var(--danger); }
+      .btn.rec { background: var(--danger); text-shadow: none; }
       .btn.sm { padding: 5px 9px; font-size: 11px; }
       .row { display: flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
 
@@ -583,7 +698,7 @@
       .note { font-size: 11px; color: var(--muted); line-height: 1.4; }
       .summary-out {
         background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-        padding: 10px; font-size: 12px; line-height: 1.5; white-space: pre-wrap; min-height: 68px;
+        padding: 10px; font-size: 12px; line-height: 1.5; white-space: pre-wrap; min-height: 84px;
       }
       .theme-card {
         display: flex; justify-content: space-between; align-items: center; padding: 10px 12px;
@@ -629,7 +744,6 @@
           </div>
         </div>
 
-        <!-- CONTADOR DE TMA -->
         <div class="tma-box" title="(Fala/Interação + Espera/Hold + Tabulação pós-atendimento) ÷ Total de atendimentos finalizados">
           <div>
             <span class="tma-lbl">TMA Calculado</span>
@@ -681,28 +795,35 @@
       </div>
     </div>
 
-    <!-- PAINEL: IA RESUMO -->
+    <!-- PAINEL: ADA IA (RESUMO OBJETIVO) -->
     <div id="panel-ai" class="panel" style="bottom: 88px; right: 386px;">
       <div class="p-head anim-grad" data-drag="panel-ai">
-        <span class="p-title">✨ Resumo IA • gpt-oss-20b</span>
+        <span class="p-title">✨ ADA IA • Resumo</span>
         <button class="p-close" data-toggle="panel-ai">✕</button>
       </div>
       <div class="p-body">
         <details>
-          <summary>⚙ Configurar API (Groq / OpenRouter / OpenAI)</summary>
+          <summary>⚙ Configurar API (Groq / OpenAI)</summary>
           <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:6px;">
             <input id="ai-url" placeholder="Endpoint URL" />
             <input id="ai-key" type="password" placeholder="API Key (salva localmente)" />
             <button id="ai-save-cfg" class="btn sec" style="padding:5px;">Salvar</button>
           </div>
         </details>
+
         <div class="row">
-          <button id="btn-rec" class="btn sec" style="flex:1;">🎙 Gravar Voz</button>
+          <button id="btn-rec-call" class="btn anim-grad" style="flex:1;">📞 Gravar Ligação</button>
           <button id="btn-clear-txt" class="btn sec">Limpar</button>
         </div>
-        <textarea id="ai-input" rows="5" placeholder="Transcreva por voz ou cole o atendimento. A IA identifica Atendente, Cliente e se a ligação caiu ou foi finalizada (sem salvar dados pessoais)."></textarea>
-        <button id="btn-summarize" class="btn anim-grad">Gerar Resumo em 1 Mensagem</button>
-        <div id="ai-output" class="summary-out">O resumo estruturado aparecerá aqui.</div>
+
+        <div id="rec-status" class="rec-status">
+          <span>🎙 Entrada: Atendente • 🔊 Saída: Cliente</span>
+          <strong id="rec-timer">00:00</strong>
+        </div>
+
+        <textarea id="ai-input" rows="5" placeholder="A transcrição da ligação aparecerá aqui (ou digite/cole anotações rápidas para a ADA IA gerar o resumo)."></textarea>
+        <button id="btn-summarize" class="btn anim-grad">Gerar Resumo</button>
+        <div id="ai-output" class="summary-out">O resumo pronto para tabulação aparecerá aqui.</div>
         <button id="btn-copy-ai" class="btn sec">Copiar Resumo</button>
       </div>
     </div>
@@ -763,7 +884,7 @@
       <div id="fab-stack" class="fab-stack">
         <button class="fab-sub active" data-toggle="panel-int" data-tip="Interações">📊</button>
         <button class="fab-sub" data-toggle="panel-met" data-tip="Métricas">📈</button>
-        <button class="fab-sub" data-toggle="panel-ai" data-tip="Resumo IA">✨</button>
+        <button class="fab-sub" data-toggle="panel-ai" data-tip="ADA IA">✨</button>
         <button class="fab-sub" data-toggle="panel-vis" data-tip="Visuais">🎨</button>
         <button class="fab-sub" data-toggle="panel-cfg" data-tip="Configurações">⚙️</button>
       </div>
@@ -834,7 +955,7 @@
     btn.addEventListener('click', () => togglePanelById(btn.dataset.toggle));
   });
 
-  // ===== CONFIGURAÇÕES (EDIÇÃO MANUAL + RELÓGIO + TMA) =====
+  // ===== CONFIGURAÇÕES =====
   const getAutoCounts = () => {
     const valid = Object.values(interactions).filter(v => v.counted);
     return {
@@ -983,7 +1104,6 @@
     shadow.getElementById('sq-chat').textContent = chats;
     shadow.getElementById('sq-voice').textContent = voices;
 
-    // Cálculo do TMA: (Interação + Espera + Tabulação) ÷ Total de atendimentos finalizados
     const finalizedForTma = Object.values(interactions).filter(v => v.tmaFinalized && (v.tmaSeconds || 0) >= 10);
     const totalTmaSec = finalizedForTma.reduce((acc, v) => acc + (v.tmaSeconds || 0), 0);
     const avgTma = finalizedForTma.length ? Math.round(totalTmaSec / finalizedForTma.length) : 0;
@@ -1029,10 +1149,19 @@
   };
 
   let tickCount = 0;
+  let recSeconds = 0;
+  let isCallRecording = false;
+
   window.__gcProInterval = setInterval(() => {
     tickCount += 1;
     updateClock();
     ensureCopyBothButton();
+
+    if (isCallRecording) {
+      recSeconds += 1;
+      const rt = shadow.getElementById('rec-timer');
+      if (rt) rt.textContent = fmtTime(recSeconds);
+    }
 
     if (tickCount % 180 === 0) syncMetricsAPI();
 
@@ -1042,25 +1171,16 @@
     const lbl = shadow.getElementById('live-label');
     const tmr = shadow.getElementById('live-timer');
 
-    // Registra ou atualiza a interação ativa
+    let activeKey = null;
+
     if (active) {
-      if (!interactions[active.key]) {
-        interactions[active.key] = {
-          name: active.name,
-          rawName: active.rawName,
-          channel: active.channel,
-          seconds: 0,
-          counted: false,
-          countedAt: null,
-          countedTs: 0,
-          tmaSeconds: 0,
-          tmaFinalized: false,
-          missingTicks: 0
-        };
-      }
-      const rec = interactions[active.key];
+      const resolved = resolveInteractionRecord(active);
+      activeKey = resolved.key;
+      const rec = resolved.rec;
+
       rec.name = active.name;
       rec.rawName = active.rawName || rec.rawName;
+      rec.lastSeenTs = Date.now();
 
       if (!rec.counted) {
         rec.seconds += 1;
@@ -1090,16 +1210,15 @@
       tmr.textContent = '00:00';
     }
 
-    // Atualiza o TMA de todos os atendimentos em andamento (Fala/Interação + Hold + Tabulação)
-    // Para automaticamente quando o chamado é encerrado e tabulado (sai da lista de conversas ativas)
     Object.entries(interactions).forEach(([key, rec]) => {
       if (rec.tmaFinalized) return;
-      const isCurrentlySelected = active && active.key === key;
+      const isCurrentlySelected = activeKey && activeKey === key;
       const hint = (rec.rawName || rec.name || '').slice(0, 12);
       const stillInRoster = hint && rosterText.includes(hint);
 
       if (isCurrentlySelected || stillInRoster) {
         rec.tmaSeconds = (rec.tmaSeconds || 0) + 1;
+        rec.lastSeenTs = Date.now();
         rec.missingTicks = 0;
       } else {
         rec.missingTicks = (rec.missingTicks || 0) + 1;
@@ -1113,11 +1232,13 @@
     renderInteractions();
   }, 1000);
 
-  // ===== IA RESUMO + VOZ =====
+  // ===== ADA IA: CAPTURA INTERNA SEM COMPARTILHAMENTO + RESUMO OBJETIVO =====
   const urlIn = shadow.getElementById('ai-url');
   const keyIn = shadow.getElementById('ai-key');
   const txtIn = shadow.getElementById('ai-input');
   const outEl = shadow.getElementById('ai-output');
+  const btnRecCall = shadow.getElementById('btn-rec-call');
+  const recStatusEl = shadow.getElementById('rec-status');
   urlIn.value = config.apiUrl;
   keyIn.value = config.apiKey;
 
@@ -1128,52 +1249,93 @@
     outEl.textContent = 'Configuração salva.';
   };
 
-  shadow.getElementById('btn-clear-txt').onclick = () => { txtIn.value = ''; };
-
-  const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let recognition = null, isRecording = false;
-  const btnRec = shadow.getElementById('btn-rec');
-
-  if (SpeechRec) {
-    recognition = new SpeechRec();
-    recognition.lang = 'pt-BR';
-    recognition.continuous = true;
-    recognition.interimResults = false;
-    recognition.onresult = (e) => {
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          txtIn.value += (txtIn.value ? ' ' : '') + e.results[i][0].transcript.trim();
-        }
-      }
-    };
-    recognition.onend = () => { if (isRecording) recognition.start(); };
-  }
-
-  btnRec.onclick = () => {
-    if (!recognition) {
-      outEl.textContent = 'Navegador sem suporte a transcrição nativa (use Chrome ou Edge).';
-      return;
-    }
-    if (!isRecording) {
-      isRecording = true;
-      recognition.start();
-      btnRec.textContent = '⏹ Parar Gravação';
-      btnRec.classList.add('rec');
-    } else {
-      isRecording = false;
-      recognition.stop();
-      btnRec.textContent = '🎙 Gravar Voz';
-      btnRec.classList.remove('rec');
-    }
+  shadow.getElementById('btn-clear-txt').onclick = () => {
+    txtIn.value = '';
+    outEl.textContent = 'O resumo pronto para tabulação aparecerá aqui.';
   };
 
-  shadow.getElementById('btn-summarize').onclick = async () => {
+  let micStream = null, remoteStream = null;
+  let micRec = null, remoteRec = null;
+  let micChunks = [], remoteChunks = [];
+
+  const getMimeType = () => {
+    const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+    return types.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  };
+
+  const findGenesysRemoteAudioStream = () => {
+    const tracks = [];
+    const scanDoc = (doc) => {
+      if (!doc) return;
+      doc.querySelectorAll('audio, video').forEach((el) => {
+        try {
+          if (el.srcObject && el.srcObject.getAudioTracks) {
+            el.srcObject.getAudioTracks().forEach((t) => {
+              if (t.readyState === 'live') tracks.push(t.clone());
+            });
+          }
+        } catch {}
+      });
+    };
+
+    scanDoc(document);
+    document.querySelectorAll('iframe').forEach((f) => {
+      try { scanDoc(f.contentDocument); } catch {}
+    });
+
+    return tracks.length ? new MediaStream(tracks) : null;
+  };
+
+  const stopRecorder = (rec, chunks) => new Promise((resolve) => {
+    if (!rec || rec.state === 'inactive') return resolve(null);
+    rec.onstop = () => {
+      const mime = rec.mimeType || 'audio/webm';
+      const blob = chunks.length ? new Blob(chunks, { type: mime }) : null;
+      resolve(blob && blob.size > 1500 ? blob : null);
+    };
+    rec.stop();
+  });
+
+  const transcribeTrack = async (blob, speakerLabel) => {
+    if (!blob) return [];
+    const sttUrl = config.apiUrl.replace(/\/chat\/completions\/?$/i, '/audio/transcriptions');
+    const sttModel = /openai\.com/i.test(sttUrl) ? 'whisper-1' : 'whisper-large-v3-turbo';
+
+    const fd = new FormData();
+    fd.append('file', blob, `${speakerLabel.toLowerCase()}.webm`);
+    fd.append('model', sttModel);
+    fd.append('language', 'pt');
+    fd.append('response_format', 'verbose_json');
+
+    const res = await fetch(sttUrl, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + config.apiKey },
+      body: fd
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error?.message || `Erro ao transcrever ${speakerLabel}`);
+
+    const segs = Array.isArray(data.segments) && data.segments.length
+      ? data.segments
+      : (data.text ? [{ start: 0, text: data.text, no_speech_prob: 0 }] : []);
+
+    return segs
+      .filter(s => (s.no_speech_prob ?? 0) < 0.72 && (s.text || '').trim().length > 1)
+      .map(s => ({
+        start: typeof s.start === 'number' ? s.start : 0,
+        speaker: speakerLabel,
+        text: s.text.trim()
+      }));
+  };
+
+  const runSummarize = async () => {
     const raw = txtIn.value.trim();
-    if (!raw) { outEl.textContent = 'Grave ou cole o atendimento antes de resumir.'; return; }
+    if (!raw) { outEl.textContent = 'Grave a ligação ou cole anotações antes de gerar o resumo.'; return; }
     if (!config.apiKey) { outEl.textContent = 'Informe sua API Key na configuração acima.'; return; }
 
-    const safeText = scrubPII(raw);
-    outEl.textContent = 'Analisando papéis e gerando resumo seguro...';
+    const safeText = scrubPII(raw, true);
+    outEl.textContent = 'ADA IA gerando resumo...';
 
     try {
       const res = await fetch(config.apiUrl, {
@@ -1188,7 +1350,16 @@
           messages: [
             {
               role: 'system',
-              content: 'Você é um analista de atendimento. Analise a transcrição e gere UMA ÚNICA mensagem objetiva em português resumindo o atendimento. REGRAS OBRIGATÓRIAS: 1) Identifique claramente o que o Cliente solicitou/relatou e o que o Atendente orientou/executou. 2) Identifique e informe explicitamente se a ligação/atendimento foi finalizado normalmente ou se caiu/foi interrompido abruptamente. 3) NUNCA inclua ou guarde dados pessoais do cliente (nome, CPF, telefone, e-mail, endereço ou protocolo sensível).'
+              content:
+                'Você é a ADA IA, assistente de registro de atendimento. Sua tarefa é gerar UM ÚNICO PARÁGRAFO curto, claro e objetivo em português, pronto para colar na tabulação, descartando conversas irrelevantes e excesso de detalhes.\n\n' +
+                'EXEMPLOS DO MODELO EXATO:\n' +
+                'Exemplo 1: "Cliente entrou em contato cobrando atendimento, visto o mesmo encontrar-se dentro do prazo, informado e reforçado prazo ao cliente, o mesmo ciente. Por gentileza, verificar e priorizar."\n' +
+                'Exemplo 2: "Cliente entrou em contato informando que os serviços da Brisanet estão sem sinal. Ao ser questionado sobre a ativação da LED PON e a ocorrência de acidentes ou remoção de equipamento, o cliente negou qualquer incidente. Após verificar que a rota está normal, procedeu-se à reconfiguração e reinicialização do modem ONU, além de conectá-lo em outra tomada de energia. O cliente reportou que o acesso foi normalizado."\n\n' +
+                'REGRAS OBRIGATÓRIAS:\n' +
+                '1) Escreva SOMENTE um parágrafo corrido (sem tópicos, sem listas, sem títulos e sem quebras de linha).\n' +
+                '2) Vá direto ao ponto: motivo do contato, verificações/ações relevantes e desfecho (normalizou, ciente, encaminhado ou ligação caiu). Ignore saudações, repetições e detalhes irrelevantes.\n' +
+                '3) Permita apenas número de contato caso seja relevante. NUNCA inclua nome do cliente, CPF, CNPJ, e-mail, endereço ou outros dados pessoais.\n' +
+                '4) Seja fiel ao que ocorreu, sem inventar procedimentos.'
             },
             { role: 'user', content: safeText }
           ]
@@ -1201,6 +1372,113 @@
       outEl.textContent = 'Erro: ' + err.message;
     }
   };
+
+  const stopCallAndProcess = async () => {
+    if (!isCallRecording) return;
+    isCallRecording = false;
+    btnRecCall.textContent = '⏳ Transcrevendo...';
+    btnRecCall.disabled = true;
+    btnRecCall.classList.remove('rec');
+    btnRecCall.classList.add('anim-grad');
+    recStatusEl.classList.remove('active');
+    recStatusEl.innerHTML = '<span>⏳ Processando áudio...</span><strong id="rec-timer">' + fmtTime(recSeconds) + '</strong>';
+
+    try {
+      const [micBlob, remoteBlob] = await Promise.all([
+        stopRecorder(micRec, micChunks),
+        stopRecorder(remoteRec, remoteChunks)
+      ]);
+
+      if (micStream) micStream.getTracks().forEach(t => t.stop());
+      if (remoteStream) remoteStream.getTracks().forEach(t => t.stop());
+      micStream = null; remoteStream = null; micRec = null; remoteRec = null;
+
+      if (!micBlob && !remoteBlob) {
+        outEl.textContent = 'Nenhum áudio capturado. Tente gravar novamente.';
+      } else {
+        outEl.textContent = 'ADA IA transcrevendo a ligação...';
+        const [attSegs, cliSegs] = await Promise.all([
+          transcribeTrack(micBlob, 'Atendente'),
+          transcribeTrack(remoteBlob, 'Cliente')
+        ]);
+
+        const merged = [...attSegs, ...cliSegs].sort((a, b) => a.start - b.start);
+        if (!merged.length) {
+          outEl.textContent = 'Não foi possível identificar falas no áudio gravado.';
+        } else {
+          txtIn.value = merged
+            .map(m => `[${fmtTime(m.start)}] ${m.speaker}: ${scrubPII(m.text, true)}`)
+            .join('\n');
+          await runSummarize();
+        }
+      }
+    } catch (err) {
+      outEl.textContent = 'Erro na transcrição: ' + err.message;
+    } finally {
+      btnRecCall.disabled = false;
+      btnRecCall.textContent = '📞 Gravar Ligação';
+      recStatusEl.innerHTML = '<span>🎙 Entrada: Atendente • 🔊 Saída: Cliente</span><strong id="rec-timer">00:00</strong>';
+    }
+  };
+
+  btnRecCall.onclick = async () => {
+    if (isCallRecording) {
+      await stopCallAndProcess();
+      return;
+    }
+    if (!config.apiKey) {
+      outEl.textContent = 'Configure sua API Key da Groq acima antes de gravar.';
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      outEl.textContent = 'O navegador/política da empresa bloqueou acesso ao microfone. Cole anotações abaixo e clique em "Gerar Resumo".';
+      return;
+    }
+
+    try {
+      outEl.textContent = 'Iniciando gravação...';
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      remoteStream = findGenesysRemoteAudioStream();
+
+      const hasRemote = !!remoteStream;
+      const mime = getMimeType();
+      const opts = mime ? { mimeType: mime } : undefined;
+
+      micChunks = [];
+      remoteChunks = [];
+
+      micRec = new MediaRecorder(micStream, opts);
+      micRec.ondataavailable = (e) => { if (e.data && e.data.size > 0) micChunks.push(e.data); };
+
+      if (hasRemote) {
+        remoteRec = new MediaRecorder(remoteStream, opts);
+        remoteRec.ondataavailable = (e) => { if (e.data && e.data.size > 0) remoteChunks.push(e.data); };
+      }
+
+      recSeconds = 0;
+      isCallRecording = true;
+      micRec.start(1000);
+      if (remoteRec) remoteRec.start(1000);
+
+      btnRecCall.textContent = '⏹ Parar e Resumir';
+      btnRecCall.classList.remove('anim-grad');
+      btnRecCall.classList.add('rec');
+      recStatusEl.classList.add('active');
+      recStatusEl.innerHTML = hasRemote
+        ? '<span><span class="rec-dot"></span>🎙 Atendente + 🔊 Cliente</span><strong id="rec-timer">00:00</strong>'
+        : '<span><span class="rec-dot"></span>🎙 Atendente (microfone)</span><strong id="rec-timer">00:00</strong>';
+      outEl.textContent = hasRemote
+        ? 'Gravando ligação (Atendente + Cliente). Clique em "Parar e Resumir" ao encerrar.'
+        : 'Áudio interno do cliente não detectado nesta tela. Gravando microfone (Atendente).';
+    } catch (err) {
+      if (micStream) micStream.getTracks().forEach(t => t.stop());
+      if (remoteStream) remoteStream.getTracks().forEach(t => t.stop());
+      micStream = null; remoteStream = null;
+      outEl.textContent = 'Permissão de microfone bloqueada (' + err.name + '). Cole anotações acima e clique em "Gerar Resumo".';
+    }
+  };
+
+  shadow.getElementById('btn-summarize').onclick = () => runSummarize();
 
   shadow.getElementById('btn-copy-ai').onclick = () => {
     navigator.clipboard.writeText(outEl.textContent);
